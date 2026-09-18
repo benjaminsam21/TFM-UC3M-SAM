@@ -1,0 +1,1590 @@
+---
+title: "Thesis Pipeline"
+format: html
+editor_options:
+  chunk_output_type: console
+---
+
+## Section A — Setup
+
+```{r setup-libraries}
+#| message: false
+library(openalexR)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(igraph)
+library(purrr)
+
+options(openalexR.apikey = Sys.getenv("OPENALEX_API_KEY"))
+```
+
+```{r setup-config-helpers}
+oa_fetch_retry <- function(..., max_tries = 5, base_delay = 2) {
+  for (attempt in seq_len(max_tries)) {
+    result <- tryCatch(oa_fetch(...), error = function(e) e)
+    ok <- !inherits(result, "error") && !is.null(result) &&
+      !(is.data.frame(result) && nrow(result) == 0)
+    if (ok) return(result)
+    if (attempt == max_tries) {
+      if (inherits(result, "error")) stop(result)
+      stop("oa_fetch_retry: oa_fetch() returned NULL/empty after ", max_tries,
+           " attempts (a rate-limit or API error that didn't surface as an R error)")
+    }
+    msg <- if (inherits(result, "error")) conditionMessage(result) else "oa_fetch() returned NULL/empty"
+    wait <- base_delay * 2^(attempt - 1) + stats::runif(1, 0, 1)
+    message(sprintf("oa_fetch failed (attempt %d/%d): %s -- retrying in %.1fs",
+                     attempt, max_tries, msg, wait))
+    Sys.sleep(wait)
+  }
+}
+
+extract_count <- function(res) {
+  if (!is.null(res$count)) return(res$count[1])
+  if (!is.null(attr(res, "count"))) return(attr(res, "count"))
+  NA_integer_
+}
+
+uni_ids <- c(
+  "UC3M" = "I50357001",
+  "UCM"  = "I121748325",
+  "URJC" = "I182083151",
+  "UAM"  = "I63634437"
+)
+
+full_window <- c(from = "2010-01-01", to = "2026-09-06")
+
+data_dir <- "data_cache"
+dir.create(data_dir, showWarnings = FALSE)
+
+cache_path <- function(institution_label, stage) {
+  file.path(data_dir, sprintf("%s_%s_%s_%s.rds",
+                              institution_label, stage, full_window["from"], full_window["to"]))
+}
+
+extract_primary_subfield <- function(topics_df) {
+  if (is.null(topics_df) || nrow(topics_df) == 0) return(NA_character_)
+  row <- topics_df[topics_df$i == 1 & topics_df$type == "subfield", ]
+  if (nrow(row) == 0) return(NA_character_)
+  row$display_name[1]
+}
+```
+
+```{r fetch-functions}
+fetch_works_progress <- function(cache_file, checkpoint_label, per_page = 200,
+                                  pages_per_chunk = 20, ...) {
+  if (file.exists(cache_file)) {
+    message("Loading cached works from ", cache_file)
+    return(readRDS(cache_file))
+  }
+
+  filter_args <- list(...)
+  checkpoint_dir <- file.path(data_dir, paste0(checkpoint_label, "_checkpoints"))
+  dir.create(checkpoint_dir, showWarnings = FALSE)
+
+  count_result <- do.call(oa_fetch_retry, c(
+    list(entity = "works", count_only = TRUE, verbose = FALSE,
+         options = list(corpus = "all")),
+    filter_args
+  ))
+  n_records <- extract_count(count_result)
+  n_pages <- ceiling(n_records / per_page)
+  cat(sprintf("%s: %s records expected across %d pages (per_page=%d)\n",
+              checkpoint_label, format(n_records, big.mark = ","), n_pages, per_page))
+
+  if (n_records > 10000) {
+    cat(sprintf("%s: %s records exceeds the 10,000-result offset-pagination limit -- doing a single un-chunked cursor fetch (no per-chunk resume for this step)\n",
+                checkpoint_label, format(n_records, big.mark = ",")))
+    works <- do.call(oa_fetch_retry, c(
+      list(entity = "works", per_page = per_page, verbose = FALSE,
+           options = list(corpus = "all")),
+      filter_args
+    ))
+    if (is.null(works) || nrow(works) == 0) {
+      stop(checkpoint_label, ": got NULL/empty result, refusing to cache it")
+    }
+    saveRDS(works, cache_file)
+    unlink(checkpoint_dir, recursive = TRUE)
+    return(works)
+  }
+
+  page <- 1
+  while (page <= n_pages) {
+    page_end <- min(page + pages_per_chunk - 1, n_pages)
+    chunk_file <- file.path(checkpoint_dir, sprintf("pages_%05d_%05d.rds", page, page_end))
+
+    if (file.exists(chunk_file)) {
+      cat(sprintf("Skipping pages %d-%d (already fetched, resuming)\n", page, page_end))
+      page <- page_end + 1
+      next
+    }
+
+    t0 <- Sys.time()
+    cat(sprintf("[%s] %s: fetching pages %d-%d of %d...\n",
+                format(t0, "%H:%M:%S"), checkpoint_label, page, page_end, n_pages))
+
+    chunk <- do.call(oa_fetch_retry, c(
+      list(entity = "works", per_page = per_page, paging = "page",
+           pages = page:page_end, verbose = FALSE,
+           options = list(corpus = "all")),
+      filter_args
+    ))
+    elapsed <- round(as.numeric(difftime(Sys.time(), t0, units = "secs")), 1)
+    cat(sprintf("  -> got %d rows in %ss\n", nrow(chunk), elapsed))
+
+    saveRDS(chunk, chunk_file)
+    page <- page_end + 1
+  }
+
+  chunk_files <- list.files(checkpoint_dir, full.names = TRUE)
+  works <- bind_rows(lapply(chunk_files, readRDS)) %>% distinct(id, .keep_all = TRUE)
+  if (is.null(works) || nrow(works) == 0) {
+    stop(checkpoint_label, ": got NULL/empty combined result, refusing to cache it")
+  }
+  saveRDS(works, cache_file)
+  unlink(checkpoint_dir, recursive = TRUE)
+  works
+}
+
+fetch_core_authors <- function(institution_id, institution_label, from, to) {
+  works <- fetch_works_progress(
+    cache_file        = cache_path(institution_label, "core_works"),
+    checkpoint_label  = paste0(institution_label, "_core_works"),
+    "institutions.id"        = institution_id,
+    from_publication_date    = from,
+    to_publication_date      = to,
+    "primary_topic.field.id" = "33"
+  )
+  authors_flat <- works %>%
+    select(id, authorships) %>%
+    unnest(authorships, names_sep = "_")
+  unique(authors_flat$authorships_id[!is.na(authors_flat$authorships_id)])
+}
+
+fetch_broad_works <- function(core_author_ids, institution_label, from, to, batch_size = 50) {
+  cache_file <- cache_path(institution_label, "broad_works")
+  if (file.exists(cache_file)) {
+    message("Loading cached broad-fetch works from ", cache_file)
+    return(readRDS(cache_file))
+  }
+
+  checkpoint_dir <- file.path(data_dir, paste0(institution_label, "_broad_works_checkpoints"))
+  dir.create(checkpoint_dir, showWarnings = FALSE)
+
+  id_batches <- split(core_author_ids, ceiling(seq_along(core_author_ids) / batch_size))
+  n_batches <- length(id_batches)
+  cat(sprintf("%s_broad_works: %d authors split into %d batches of up to %d\n",
+              institution_label, length(core_author_ids), n_batches, batch_size))
+
+  for (i in seq_along(id_batches)) {
+    batch_file <- file.path(checkpoint_dir, sprintf("batch_%05d.rds", i))
+    if (file.exists(batch_file)) {
+      cat(sprintf("Skipping batch %d/%d (already fetched, resuming)\n", i, n_batches))
+      next
+    }
+
+    t0 <- Sys.time()
+    cat(sprintf("[%s] batch %d/%d: fetching works for %d authors...\n",
+                format(t0, "%H:%M:%S"), i, n_batches, length(id_batches[[i]])))
+
+    works_batch <- oa_fetch_retry(
+      entity                = "works",
+      author.id              = id_batches[[i]],
+      from_publication_date  = from,
+      to_publication_date    = to,
+      verbose                = FALSE,
+      options                = list(corpus = "all")
+    )
+    elapsed <- round(as.numeric(difftime(Sys.time(), t0, units = "secs")), 1)
+    cat(sprintf("  -> got %d rows in %ss\n", nrow(works_batch), elapsed))
+
+    saveRDS(works_batch, batch_file)
+  }
+
+  batch_files <- list.files(checkpoint_dir, full.names = TRUE)
+  works <- bind_rows(lapply(batch_files, readRDS)) %>% distinct(id, .keep_all = TRUE)
+  if (is.null(works) || nrow(works) == 0) {
+    stop("fetch_broad_works: got NULL/empty combined result, refusing to cache it")
+  }
+  saveRDS(works, cache_file)
+  unlink(checkpoint_dir, recursive = TRUE)
+  works
+}
+
+fetch_author_profiles <- function(institution_label, author_ids) {
+  cache_file <- cache_path(institution_label, "author_profiles")
+  if (file.exists(cache_file)) {
+    message("Loading cached author profiles from ", cache_file)
+    return(readRDS(cache_file))
+  }
+  profiles <- oa_fetch_retry(entity = "authors", identifier = author_ids, verbose = FALSE)
+  if (is.null(profiles) || nrow(profiles) == 0) {
+    stop("fetch_author_profiles: got NULL/empty result, refusing to cache it")
+  }
+  saveRDS(profiles, cache_file)
+  profiles
+}
+```
+
+```{r works-to-edges-function}
+works_to_edges <- function(works) {
+  works <- works %>% distinct(id, .keep_all = TRUE)
+  works$primary_subfield <- purrr::map_chr(works$topics, extract_primary_subfield)
+
+  works$authorships <- lapply(works$authorships, function(a) {
+    a$institution_ids <- lapply(a$affiliations, function(aff) {
+      if (is.null(aff)) character(0) else aff$id
+    })
+    a[, c("id", "display_name", "orcid", "author_position", "is_corresponding", "institution_ids")]
+  })
+
+  works %>%
+    select(work_id = id, publication_date, publication_year, primary_subfield,
+           cited_by_count, fwci, type, is_retracted, authorships) %>%
+    unnest(authorships, names_sep = "_") %>%
+    rename(
+      author_id              = authorships_id,
+      author_name            = authorships_display_name,
+      author_orcid            = authorships_orcid,
+      author_position        = authorships_author_position,
+      is_corresponding       = authorships_is_corresponding,
+      author_institution_ids = authorships_institution_ids
+    ) %>%
+    distinct(work_id, author_id, .keep_all = TRUE)
+}
+```
+
+```{r fetch-lean-edges-function}
+fetch_broad_works_edges_lean_v2 <- function(core_author_ids, institution_label, from, to, batch_size = 50) {
+  cache_file <- cache_path(institution_label, "broad_works_edges_lean_v2")
+  if (file.exists(cache_file)) {
+    message("Loading cached lean authorship edges (v2) from ", cache_file)
+    return(readRDS(cache_file))
+  }
+
+  checkpoint_dir <- file.path(data_dir, paste0(institution_label, "_broad_works_edges_lean_v2_checkpoints"))
+  dir.create(checkpoint_dir, showWarnings = FALSE)
+
+  id_batches <- split(core_author_ids, ceiling(seq_along(core_author_ids) / batch_size))
+  n_batches <- length(id_batches)
+  cat(sprintf("%s_broad_works_edges_lean_v2: %d authors split into %d batches of up to %d\n",
+              institution_label, length(core_author_ids), n_batches, batch_size))
+
+  for (i in seq_along(id_batches)) {
+    batch_file <- file.path(checkpoint_dir, sprintf("batch_%05d.rds", i))
+    if (file.exists(batch_file)) {
+      cat(sprintf("Skipping batch %d/%d (already fetched, resuming)\n", i, n_batches))
+      next
+    }
+
+    t0 <- Sys.time()
+    cat(sprintf("[%s] batch %d/%d: fetching (lean v2) works for %d authors...\n",
+                format(t0, "%H:%M:%S"), i, n_batches, length(id_batches[[i]])))
+
+    works_batch <- oa_fetch_retry(
+      entity                = "works",
+      author.id              = id_batches[[i]],
+      from_publication_date  = from,
+      to_publication_date    = to,
+      verbose                = FALSE,
+      options                = list(
+        corpus = "all",
+        select = c("id", "publication_date", "publication_year", "authorships",
+                   "topics", "cited_by_count", "fwci", "type", "is_retracted")
+      )
+    )
+
+    works_batch$primary_subfield <- purrr::map_chr(works_batch$topics, extract_primary_subfield)
+    works_batch$topics <- NULL  # dropped before it ever touches a checkpoint file
+
+    works_batch$authorships <- lapply(works_batch$authorships, function(a) {
+      a$institution_ids <- lapply(a$affiliations, function(aff) {
+        if (is.null(aff)) character(0) else aff$id
+      })
+      a[, c("id", "display_name", "orcid", "author_position", "is_corresponding", "institution_ids")]
+    })
+
+    edges_batch <- works_batch %>%
+      select(work_id = id, publication_date, publication_year, primary_subfield,
+             cited_by_count, fwci, type, is_retracted, authorships) %>%
+      unnest(authorships, names_sep = "_") %>%
+      rename(
+        author_id              = authorships_id,
+        author_name            = authorships_display_name,
+        author_orcid            = authorships_orcid,
+        author_position        = authorships_author_position,
+        is_corresponding       = authorships_is_corresponding,
+        author_institution_ids = authorships_institution_ids
+      )
+
+    elapsed <- round(as.numeric(difftime(Sys.time(), t0, units = "secs")), 1)
+    cat(sprintf("  -> got %d works / %d authorship rows in %ss\n",
+                nrow(works_batch), nrow(edges_batch), elapsed))
+
+    saveRDS(edges_batch, batch_file)
+    rm(works_batch, edges_batch)
+    gc()
+  }
+
+  batch_files <- list.files(checkpoint_dir, full.names = TRUE)
+  edges <- bind_rows(lapply(batch_files, readRDS)) %>%
+    distinct(work_id, author_id, .keep_all = TRUE)
+  if (is.null(edges) || nrow(edges) == 0) {
+    stop("fetch_broad_works_edges_lean_v2: got NULL/empty combined result, refusing to cache it")
+  }
+  saveRDS(edges, cache_file)
+  unlink(checkpoint_dir, recursive = TRUE)
+  cat(sprintf("%s: %s authorship rows saved to %s\n",
+              institution_label, format(nrow(edges), big.mark = ","), cache_file))
+  edges
+}
+```
+
+```{r fetch-core-ids}
+core_ids <- list(
+  UC3M = fetch_core_authors(uni_ids["UC3M"], "UC3M", full_window["from"], full_window["to"]),
+  UCM  = fetch_core_authors(uni_ids["UCM"],  "UCM",  full_window["from"], full_window["to"]),
+  URJC = fetch_core_authors(uni_ids["URJC"], "URJC", full_window["from"], full_window["to"]),
+  UAM  = fetch_core_authors(uni_ids["UAM"],  "UAM",  full_window["from"], full_window["to"])
+)
+cat("Core authors:", paste(names(core_ids), lengths(core_ids), sep = "=", collapse = ", "), "\n")
+```
+
+```{r fetch-uc3m-urjc-edges}
+works_full_uc3m <- fetch_broad_works(core_ids$UC3M, "UC3M", full_window["from"], full_window["to"])
+edges_uc3m <- works_to_edges(works_full_uc3m)
+cat("UC3M edges:", nrow(edges_uc3m), "\n")
+rm(works_full_uc3m); gc()
+
+works_full_urjc <- fetch_broad_works(core_ids$URJC, "URJC", full_window["from"], full_window["to"])
+edges_urjc <- works_to_edges(works_full_urjc)
+cat("URJC edges:", nrow(edges_urjc), "\n")
+rm(works_full_urjc); gc()
+```
+
+```{r fetch-ucm-uam-edges}
+edges_ucm <- fetch_broad_works_edges_lean_v2(core_ids$UCM, "UCM", full_window["from"], full_window["to"])
+edges_uam <- fetch_broad_works_edges_lean_v2(core_ids$UAM, "UAM", full_window["from"], full_window["to"])
+```
+
+```{r assemble-institution-data}
+edges_by_institution <- list(UC3M = edges_uc3m, UCM = edges_ucm, URJC = edges_urjc, UAM = edges_uam)
+
+author_profiles <- list(
+  UC3M = fetch_author_profiles("UC3M", core_ids$UC3M),
+  UCM  = fetch_author_profiles("UCM",  core_ids$UCM),
+  URJC = fetch_author_profiles("URJC", core_ids$URJC),
+  UAM  = fetch_author_profiles("UAM",  core_ids$UAM)
+)
+
+windows <- list(
+  baseline = c(from = "2010-01-01", to = "2019-12-31"),
+  post_law = c(from = "2022-01-01", to = "2025-12-31")
+)
+```
+
+## Section B — Unified network construction
+
+```{r network-functions}
+build_network_from_edges <- function(edges, max_authors = Inf, restrict_to_ids = NULL) {
+  n_authors_per_work <- edges %>% count(work_id, name = "n_authors")
+  keep_works <- n_authors_per_work %>% filter(n_authors <= max_authors) %>% pull(work_id)
+  edges <- edges %>% filter(work_id %in% keep_works)
+
+  authors_clean <- edges %>%
+    select(paper_id = work_id, author_id, author_name, author_position) %>%
+    filter(!is.na(author_id))
+
+  coauthor_edges <- authors_clean %>%
+    inner_join(authors_clean, by = "paper_id", relationship = "many-to-many") %>%
+    filter(author_id.x < author_id.y)
+
+  if (!is.null(restrict_to_ids)) {
+    coauthor_edges <- coauthor_edges %>%
+      filter(author_id.x %in% restrict_to_ids, author_id.y %in% restrict_to_ids)
+  }
+
+  author_nodes <- if (!is.null(restrict_to_ids)) {
+    data.frame(author_id = restrict_to_ids) %>%
+      left_join(authors_clean %>% distinct(author_id, author_name), by = "author_id")
+  } else {
+    authors_clean %>% group_by(author_id) %>% slice(1) %>% ungroup()
+  }
+
+  g <- graph_from_data_frame(
+    d = coauthor_edges %>%
+      select(from = author_id.x, to = author_id.y,
+             position_from = author_position.x, position_to = author_position.y),
+    directed = FALSE,
+    vertices = author_nodes %>% select(author_id, author_name)
+  )
+
+  E(g)$weight <- 1
+  g <- igraph::simplify(g, remove.multiple = TRUE, remove.loops = TRUE,
+                         edge.attr.comb = list(weight = "sum", "ignore"))
+
+  list(g = g, authors_clean = authors_clean, edges = edges)
+}
+
+network_diagnostics <- function(g, label) {
+  comp <- components(g)
+  data.frame(
+    label            = label,
+    nodes            = vcount(g),
+    edges            = ecount(g),
+    components       = comp$no,
+    largest_comp     = max(comp$csize),
+    giant_comp_share = round(max(comp$csize) / vcount(g), 3),
+    density          = round(edge_density(g), 4),
+    mean_degree      = round(mean(degree(g)), 2),
+    isolated         = sum(degree(g) == 0)
+  )
+}
+```
+
+```{r build-all-networks}
+split_windows <- function(edges) {
+  list(
+    baseline = edges %>% filter(publication_date >= windows$baseline["from"],
+                                 publication_date <= windows$baseline["to"]),
+    post_law = edges %>% filter(publication_date >= windows$post_law["from"],
+                                 publication_date <= windows$post_law["to"])
+  )
+}
+
+networks <- list()
+for (inst in names(edges_by_institution)) {
+  edges_w <- split_windows(edges_by_institution[[inst]])
+  networks[[inst]] <- list(
+    baseline = build_network_from_edges(edges_w$baseline, max_authors = 20, restrict_to_ids = core_ids[[inst]]),
+    post_law = build_network_from_edges(edges_w$post_law, max_authors = 20, restrict_to_ids = core_ids[[inst]])
+  )
+}
+
+diag_table <- bind_rows(lapply(names(networks), function(inst) {
+  bind_rows(
+    network_diagnostics(networks[[inst]]$baseline$g, paste(inst, "baseline")),
+    network_diagnostics(networks[[inst]]$post_law$g, paste(inst, "post_law"))
+  )
+}))
+print(diag_table)
+```
+
+## Section C/D — Seniority + gender, generalized
+
+```{r seniority-age-functions}
+build_seniority_age <- function(author_profiles_inst, current_year) {
+  author_profiles_inst %>%
+    select(author_id = id, display_name, h_index, counts_by_year) %>%
+    rowwise() %>%
+    mutate(
+      first_year_seen = min(counts_by_year$year, na.rm = TRUE),
+      academic_age     = current_year - first_year_seen + 1,
+      m_quotient       = h_index / academic_age
+    ) %>%
+    ungroup() %>%
+    filter(academic_age > 0) %>%
+    select(author_id, h_index, academic_age, m_quotient)
+}
+
+build_window_seniority <- function(net, author_profiles_inst, core_ids_inst, current_year) {
+  build_seniority_age(author_profiles_inst, current_year)
+}
+```
+
+```{r gender-inference-functions}
+genderize_cache_file <- file.path(data_dir, "genderize_cache.rds")
+
+load_genderize_cache <- function() {
+  if (file.exists(genderize_cache_file)) {
+    cache <- readRDS(genderize_cache_file)
+    if (!"country_id" %in% names(cache)) cache$country_id <- NA_character_
+    cache
+  } else {
+    data.frame(first_name = character(), country_id = character(), gender = character(),
+               probability = double(), count = integer(), stringsAsFactors = FALSE)
+  }
+}
+
+classify_gender <- function(gender, probability, count, prob_threshold = 0.95, min_count = 5) {
+  if (is.na(gender)) return("unclassifiable")
+  if (is.na(probability) || is.na(count)) return("unclassifiable")
+  if (probability < prob_threshold || count < min_count) return("unclassifiable")
+  gender
+}
+
+extract_first_name <- function(full_name) {
+  first <- str_extract(str_trim(full_name), "^\\S+")
+  first_clean <- str_remove_all(first, "[.,]")
+  if (is.na(first_clean) || nchar(first_clean) <= 1) return(NA_character_)
+  first_clean
+}
+
+build_authors_with_gender <- function(author_profiles_inst) {
+  full_cache <- load_genderize_cache() %>%
+    rowwise() %>%
+    mutate(name_inferred_gender = classify_gender(gender, probability, count)) %>%
+    ungroup()
+  gender_lookup_global <- full_cache %>% filter(is.na(country_id))
+  gender_lookup_es     <- full_cache %>% filter(country_id == "ES")
+
+  core_authors <- author_profiles_inst %>%
+    select(author_id = id, author_name = display_name) %>%
+    distinct(author_id, .keep_all = TRUE)
+
+  core_authors %>%
+    mutate(first_name = purrr::map_chr(author_name, extract_first_name)) %>%
+    left_join(gender_lookup_global %>% select(first_name, name_inferred_gender_global = name_inferred_gender),
+              by = "first_name") %>%
+    left_join(gender_lookup_es %>% select(first_name, name_inferred_gender_es = name_inferred_gender),
+              by = "first_name") %>%
+    mutate(
+      name_inferred_gender_global = coalesce(name_inferred_gender_global, "unclassifiable"),
+      name_inferred_gender_es     = coalesce(name_inferred_gender_es, "unclassifiable"),
+      gender_primary = if_else(name_inferred_gender_es != "unclassifiable",
+                                name_inferred_gender_es, name_inferred_gender_global)
+    )
+}
+```
+
+```{r genderize-api-functions}
+fetch_genderize_batch <- function(names_batch, country_id = NULL,
+                                   api_key = Sys.getenv("GENDERIZE_API_KEY"),
+                                   max_tries = 5, base_delay = 2) {
+  qs  <- paste0("name[]=", vapply(names_batch, utils::URLencode, character(1), reserved = TRUE),
+                collapse = "&")
+  url <- paste0("https://api.genderize.io/?", qs)
+  if (!is.null(country_id)) url <- paste0(url, "&country_id=", country_id)
+  if (nzchar(api_key)) url <- paste0(url, "&apikey=", api_key)
+
+  for (attempt in seq_len(max_tries)) {
+    result <- tryCatch(jsonlite::fromJSON(url), error = function(e) e)
+    ok <- !inherits(result, "error") && is.data.frame(result) && "gender" %in% names(result)
+    if (ok) return(result)
+
+    if (attempt == max_tries) {
+      if (inherits(result, "error")) stop(result)
+      stop("fetch_genderize_batch: unexpected response after ", max_tries, " attempts: ",
+           paste(names(result), collapse = ", "))
+    }
+    msg <- if (inherits(result, "error")) conditionMessage(result) else
+      paste("unexpected response shape:", paste(names(result), collapse = ", "))
+    wait <- base_delay * 2^(attempt - 1)
+    message(sprintf("genderize batch failed (attempt %d/%d): %s -- retrying in %ds",
+                     attempt, max_tries, msg, wait))
+    Sys.sleep(wait)
+  }
+}
+
+query_genderize_for_names <- function(names_to_check, country_id = NULL, batch_size = 100) {
+  genderize_cache <- load_genderize_cache()
+  cache_mask <- if (is.null(country_id)) {
+    is.na(genderize_cache$country_id)
+  } else {
+    genderize_cache$country_id == country_id
+  }
+  already_done <- genderize_cache$first_name[cache_mask]
+  to_query <- setdiff(names_to_check, already_done)
+
+  label <- if (is.null(country_id)) "global" else country_id
+  cat(sprintf("%s new names to query for country_id = %s (%s already cached)\n",
+              length(to_query), label, length(names_to_check) - length(to_query)))
+  if (length(to_query) == 0) return(invisible(genderize_cache))
+
+  checkpoint_dir <- file.path(data_dir, paste0("genderize_", label, "_bs", batch_size, "_checkpoints"))
+  dir.create(checkpoint_dir, showWarnings = FALSE)
+
+  batches <- split(to_query, ceiling(seq_along(to_query) / batch_size))
+  n_batches <- length(batches)
+
+  for (i in seq_along(batches)) {
+    batch_file <- file.path(checkpoint_dir, sprintf("batch_%05d.rds", i))
+    if (file.exists(batch_file)) {
+      cat(sprintf("Skipping batch %d/%d (already fetched, resuming)\n", i, n_batches))
+      next
+    }
+
+    cat(sprintf("[%s] %s batch %d/%d (%d names)...\n",
+                format(Sys.time(), "%H:%M:%S"), label, i, n_batches, length(batches[[i]])))
+
+    result <- tryCatch(fetch_genderize_batch(batches[[i]], country_id = country_id),
+                        error = function(e) e)
+
+    if (inherits(result, "error")) {
+      warning(sprintf("Batch %d/%d failed as a whole (%s) -- retrying its %d names individually",
+                       i, n_batches, conditionMessage(result), length(batches[[i]])), call. = FALSE)
+      single_results <- lapply(batches[[i]], function(nm) {
+        tryCatch(
+          fetch_genderize_batch(nm, country_id = country_id, max_tries = 2),
+          error = function(e) {
+            warning(sprintf("'%s' failed even queried alone (%s) -- skipped, will remain unclassifiable",
+                             nm, conditionMessage(e)), call. = FALSE)
+            NULL
+          }
+        )
+      })
+      single_results <- single_results[!vapply(single_results, is.null, logical(1))]
+      if (length(single_results) == 0) next  # every name in this batch was unrecoverable
+      result <- bind_rows(single_results)
+    }
+
+    batch_df <- result %>%
+      select(first_name = name, gender, probability, count) %>%
+      mutate(country_id = if (is.null(country_id)) NA_character_ else country_id)
+    saveRDS(batch_df, batch_file)
+  }
+
+  batch_files <- list.files(checkpoint_dir, full.names = TRUE)
+  genderize_cache <- bind_rows(genderize_cache, lapply(batch_files, readRDS))
+  saveRDS(genderize_cache, genderize_cache_file)
+  unlink(checkpoint_dir, recursive = TRUE)
+  invisible(genderize_cache)
+}
+```
+
+```{r run-genderize-queries}
+#| eval: false
+all_first_names <- unique(unlist(lapply(names(author_profiles), function(inst) {
+  purrr::map_chr(author_profiles[[inst]]$display_name, extract_first_name)
+})))
+all_first_names <- all_first_names[!is.na(all_first_names)]
+
+query_genderize_for_names(all_first_names, country_id = NULL, batch_size = 25)  # global
+query_genderize_for_names(all_first_names, country_id = "ES",  batch_size = 25)  # Spain-specific
+```
+
+## Section E/F — Model dataset + degree/betweenness models
+
+```{r model-df-builder-functions}
+build_paper_counts_from_edges <- function(net, core_ids_inst) {
+  net$edges %>%
+    filter(author_id %in% core_ids_inst) %>%
+    distinct(work_id, author_id) %>%
+    count(author_id, name = "paper_count")
+}
+
+build_primary_subfield_from_edges <- function(net, core_ids_inst) {
+  net$edges %>%
+    filter(author_id %in% core_ids_inst, !is.na(primary_subfield)) %>%
+    distinct(work_id, author_id, primary_subfield) %>%
+    count(author_id, primary_subfield, name = "n_papers_in_subfield") %>%
+    group_by(author_id) %>%
+    slice_max(n_papers_in_subfield, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(author_id, primary_subfield)
+}
+
+build_model_df_row <- function(net, seniority_w, window_label) {
+  data.frame(
+    author_id = V(net$g)$name,
+    degree    = igraph::degree(net$g),
+    strength  = igraph::strength(net$g),
+    betweenness = igraph::betweenness(net$g, weights = NA),
+    window    = window_label,
+    stringsAsFactors = FALSE
+  ) %>%
+    left_join(seniority_w, by = "author_id")
+}
+
+build_model_df_for_windows <- function(inst, nets_by_window, current_years_by_window) {
+  core_ids_inst <- core_ids[[inst]]
+  author_profiles_inst <- author_profiles[[inst]]
+  authors_with_gender <- build_authors_with_gender(author_profiles_inst) %>%
+    select(author_id, gender_primary)
+
+  window_labels <- names(nets_by_window)
+
+  seniority_by_window <- setNames(lapply(window_labels, function(w) {
+    build_window_seniority(nets_by_window[[w]], author_profiles_inst, core_ids_inst,
+                            current_year = current_years_by_window[[w]])
+  }), window_labels)
+
+  extras_by_window <- setNames(lapply(window_labels, function(w) {
+    build_paper_counts_from_edges(nets_by_window[[w]], core_ids_inst) %>%
+      full_join(build_primary_subfield_from_edges(nets_by_window[[w]], core_ids_inst), by = "author_id") %>%
+      mutate(window = w)
+  }), window_labels)
+
+  model_df <- bind_rows(lapply(window_labels, function(w) {
+    build_model_df_row(nets_by_window[[w]], seniority_by_window[[w]], w)
+  })) %>%
+    mutate(window = factor(window, levels = window_labels)) %>%
+    left_join(
+      bind_rows(extras_by_window) %>% mutate(window = factor(window, levels = window_labels)),
+      by = c("author_id", "window")
+    ) %>%
+    left_join(authors_with_gender, by = "author_id") %>%
+    mutate(
+      paper_count = coalesce(paper_count, 0L),
+      primary_subfield = case_when(
+        paper_count == 0        ~ "no_papers_this_window",
+        is.na(primary_subfield) ~ "no_valid_subfield",
+        TRUE                     ~ primary_subfield
+      )
+    )
+
+  top_subfields <- model_df %>%
+    filter(primary_subfield != "no_papers_this_window") %>%
+    count(primary_subfield, sort = TRUE) %>%
+    slice_head(n = 10) %>%
+    pull(primary_subfield)
+
+  model_df <- model_df %>%
+    mutate(primary_subfield_grp = factor(case_when(
+      primary_subfield == "no_papers_this_window" ~ "no_papers_this_window",
+      primary_subfield == "no_valid_subfield"      ~ "other_subfield",
+      primary_subfield %in% top_subfields          ~ primary_subfield,
+      TRUE                                          ~ "other_subfield"
+    )))
+
+  model_df %>%
+    filter(gender_primary %in% c("male", "female"), paper_count > 0) %>%
+    mutate(
+      gender_primary = factor(gender_primary, levels = c("male", "female")),
+      primary_subfield_grp = droplevels(primary_subfield_grp)
+    )
+}
+```
+
+```{r genderize-attrition-check}
+genderize_attrition_diag <- list()
+for (inst in names(networks)) {
+  gender_lookup_inst <- build_authors_with_gender(author_profiles[[inst]])
+
+  subfield_combined <- bind_rows(
+    build_primary_subfield_from_edges(networks[[inst]]$baseline, core_ids[[inst]]),
+    build_primary_subfield_from_edges(networks[[inst]]$post_law, core_ids[[inst]])
+  ) %>%
+    count(author_id, primary_subfield, name = "n") %>%
+    group_by(author_id) %>%
+    slice_max(n, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(author_id, primary_subfield)
+
+  joined <- gender_lookup_inst %>%
+    mutate(classified = gender_primary != "unclassifiable") %>%
+    left_join(subfield_combined, by = "author_id") %>%
+    filter(!is.na(primary_subfield))
+
+  top_subfields <- joined %>% count(primary_subfield, sort = TRUE) %>% slice_head(n = 10) %>% pull(primary_subfield)
+  joined <- joined %>% mutate(subfield_grp = if_else(primary_subfield %in% top_subfields, primary_subfield, "other"))
+
+  tab <- table(joined$subfield_grp, joined$classified)
+  test <- chisq.test(tab)
+  cramers_v <- sqrt(as.numeric(test$statistic) / (sum(tab) * (min(dim(tab)) - 1)))
+
+  n_total <- nrow(gender_lookup_inst)
+  n_unclassified <- sum(gender_lookup_inst$gender_primary == "unclassifiable")
+
+  genderize_attrition_diag[[inst]] <- data.frame(
+    institution = inst, n_total = n_total,
+    pct_classified = round(100 * (1 - n_unclassified / n_total), 1),
+    chisq_p = signif(test$p.value, 3),
+    cramers_v = round(cramers_v, 3)
+  )
+  cat(sprintf("%s: classified %.1f%% of %d authors; subfield imbalance chi-sq p=%.3g, Cramer's V=%.3f\n",
+              inst, genderize_attrition_diag[[inst]]$pct_classified, n_total, test$p.value, cramers_v))
+}
+genderize_attrition_summary <- bind_rows(genderize_attrition_diag)
+print(genderize_attrition_summary)
+```
+
+```{r nb-model-diagnostic-guards}
+check_nb_theta <- function(model, label, threshold = 100) {
+  theta <- tryCatch(summary(model)$theta, error = function(e) NA_real_)
+  if (is.na(theta)) return(invisible(theta))
+  if (theta > threshold) {
+    warning(sprintf(
+      "%s: theta.ml() likely diverged (theta = %.0f, expected order 1-10 on this project's data) -- distrust this fit's SEs/p-values; prefer the zeroinfl equivalent instead",
+      label, theta
+    ), call. = FALSE)
+  }
+  invisible(theta)
+}
+
+tiered_convergence_check <- function(model, label) {
+  msgs <- tryCatch(model@optinfo$conv$lme4$messages, error = function(e) NULL)
+  if (!is.null(msgs)) {
+    cat(sprintf("%s: lme4-reported convergence message present (%s)\n", label, paste(msgs, collapse = "; ")))
+  }
+
+  relgrad_ok <- tryCatch({
+    if (is.null(model@optinfo$derivs)) stop("derivs not populated")
+    relgrad <- with(model@optinfo$derivs, solve(Hessian, gradient))
+    max_relgrad <- max(abs(relgrad))
+    cat(sprintf("%s: Tier 1 -- max relative gradient: %.5f\n", label, max_relgrad))
+    max_relgrad < 0.001
+  }, error = function(e) {
+    cat(sprintf("%s: Tier 1 -- could not compute (%s), escalating to Tier 2\n", label, conditionMessage(e)))
+    FALSE
+  })
+  if (relgrad_ok) {
+    cat(sprintf("%s: small relative gradient -- fit is trustworthy, stopping here\n", label))
+    return(invisible("clean_gradient"))
+  }
+
+  cat(sprintf("%s: Tier 2 -- restarting from final parameters...\n", label))
+  ss <- getME(model, c("theta", "fixef"))
+  t0 <- Sys.time()
+  model_refit <- update(model, start = ss)
+  cat(sprintf("  refit done in %.1fs\n", as.numeric(difftime(Sys.time(), t0, units = "secs"))))
+  refit_msgs <- tryCatch(model_refit@optinfo$conv$lme4$messages, error = function(e) NULL)
+  coef_shift <- max(abs(lme4::fixef(model_refit) - lme4::fixef(model)))
+  cat(sprintf("  refit clean: %s | max |coefficient shift|: %.5f\n",
+              is.null(refit_msgs), coef_shift))
+  if (is.null(refit_msgs) && coef_shift < 0.01) {
+    cat(sprintf("%s: restart converged cleanly with a stable coefficient -- treating as resolved\n", label))
+    return(invisible("resolved_restart"))
+  }
+
+  cat(sprintf("%s: NOT resolved by Tiers 1-2 -- recommend running validate_glmer_across_optimizers() by hand before trusting this result\n", label))
+  invisible("needs_manual_allfit")
+}
+
+validate_glmer_across_optimizers <- function(model, term) {
+  af <- lme4::allFit(model)
+  ss <- summary(af)
+  list(messages = ss$msgs, estimates = ss$fixef[, term])
+}
+```
+
+```{r overdispersion-icc-guards}
+check_overdispersion <- function(y, label, threshold = 1000) {
+  ratio <- var(y) / mean(y)
+  cat(sprintf("%s: var/mean = %.1f%s\n", label, ratio,
+              if (ratio > threshold) " -- EXTREME, expect glm.nb's theta estimation to be fragile here" else ""))
+  invisible(ratio)
+}
+
+report_icc <- function(model, label) {
+  icc_val <- tryCatch(performance::icc(model), error = function(e) NULL)
+  if (!is.null(icc_val)) {
+    cat(sprintf("%s: ICC (adjusted) = %.3f, ICC (unadjusted) = %.3f\n",
+                label, icc_val$ICC_adjusted, icc_val$ICC_unadjusted))
+  }
+  invisible(icc_val)
+}
+```
+
+```{r model-selection-diagnostics}
+diag_model_df <- build_model_df_for_windows(
+  "UC3M",
+  nets_by_window = list(baseline = networks$UC3M$baseline, post_law = networks$UC3M$post_law),
+  current_years_by_window = list(baseline = 2019, post_law = 2025)
+)
+
+diag_dispersion_ratio <- var(diag_model_df$degree) / mean(diag_model_df$degree)
+diag_m_pois <- glm(degree ~ gender_primary * window + m_quotient + academic_age +
+                      log1p(paper_count) + primary_subfield_grp,
+                    data = diag_model_df, family = poisson)
+diag_pearson_disp <- sum(residuals(diag_m_pois, type = "pearson")^2) / df.residual(diag_m_pois)
+diag_z <- (diag_pearson_disp - 1) / sqrt(2 / df.residual(diag_m_pois))
+cat(sprintf("Degree var/mean = %.2f; Pearson dispersion = %.2f (z = %.1f, p < .001) -- NB over Poisson confirmed\n",
+            diag_dispersion_ratio, diag_pearson_disp, diag_z))
+
+diag_m_glmnb <- MASS::glm.nb(
+  degree ~ gender_primary * window + m_quotient + academic_age +
+    log1p(paper_count) + primary_subfield_grp,
+  data = diag_model_df
+)
+diag_m_zinb <- pscl::zeroinfl(
+  degree ~ gender_primary * window + m_quotient + academic_age +
+    log1p(paper_count) + primary_subfield_grp | 1,
+  data = diag_model_df, dist = "negbin"
+)
+cat("Vuong test, zeroinfl vs. glm.nb (degree):\n")
+print(pscl::vuong(diag_m_zinb, diag_m_glmnb))
+
+rm(diag_model_df, diag_m_pois, diag_m_glmnb, diag_m_zinb); gc()
+```
+
+```{r run-institution-pipeline-function}
+run_institution_pipeline <- function(inst) {
+  cat(sprintf("\n=== %s ===\n", inst))
+  net_w <- networks[[inst]]
+
+  model_df_fit <- build_model_df_for_windows(
+    inst,
+    nets_by_window = list(baseline = net_w$baseline, post_law = net_w$post_law),
+    current_years_by_window = list(baseline = 2019, post_law = 2025)
+  ) %>%
+    mutate(
+      m_quotient_z      = as.numeric(scale(m_quotient)),
+      academic_age_z    = as.numeric(scale(academic_age)),
+      log_paper_count_z = as.numeric(scale(log1p(paper_count)))
+    )
+
+  cat(sprintf("%s: model_df_fit rows = %d\n", inst, nrow(model_df_fit)))
+  check_overdispersion(model_df_fit$degree, paste(inst, "degree"))
+
+  time_fit <- function(label, expr) {
+    t0 <- Sys.time()
+    cat(sprintf("[%s] %s: fitting %s...\n", format(t0, "%H:%M:%S"), inst, label))
+    result <- expr
+    elapsed <- round(as.numeric(difftime(Sys.time(), t0, units = "secs")), 1)
+    cat(sprintf("  -> %s done in %ss\n", label, elapsed))
+    result
+  }
+
+  m_mixed <- time_fit("m_mixed (glmer.nb)", lme4::glmer.nb(
+    degree ~ gender_primary * window + m_quotient_z + academic_age_z + log_paper_count_z +
+      (1 | author_id) + (1 | primary_subfield_grp),
+    data = model_df_fit
+  ))
+  tiered_convergence_check(m_mixed, paste(inst, "degree glmer.nb"))
+  report_icc(m_mixed, paste(inst, "degree glmer.nb"))
+
+  m_betw_lmer <- time_fit("m_betw_lmer", lme4::lmer(
+    log1p(betweenness) ~ gender_primary * window + m_quotient_z + academic_age_z + log_paper_count_z +
+      (1 | author_id) + (1 | primary_subfield_grp),
+    data = model_df_fit
+  ))
+  tiered_convergence_check(m_betw_lmer, paste(inst, "betweenness lmer"))
+  betw_lmer_t <- summary(m_betw_lmer)$coefficients[, "t value"]
+
+  term <- "gender_primaryfemale:windowpost_law"
+  comparison <- data.frame(
+    institution = inst,
+    spec = c("glmer.nb (degree)", "lmer (betweenness, log1p)"),
+    estimate = c(
+      lme4::fixef(m_mixed)[term],
+      lme4::fixef(m_betw_lmer)[term]
+    ),
+    p_value = c(
+      summary(m_mixed)$coefficients[term, "Pr(>|z|)"],
+      2 * stats::pnorm(-abs(betw_lmer_t[term]))
+    )
+  )
+
+  list(
+    model_df_fit = model_df_fit,
+    models = list(mixed = m_mixed, betw_lmer = m_betw_lmer),
+    comparison = comparison
+  )
+}
+```
+
+```{r run-institution-pipeline-all}
+results <- list()
+for (inst in names(networks)) {
+  results[[inst]] <- run_institution_pipeline(inst)
+}
+
+full_comparison <- bind_rows(lapply(results, function(r) r$comparison))
+print(full_comparison)
+```
+
+## Section G — Pooled cross-institution model
+
+```{r pooled-df-construction}
+pooled_df <- bind_rows(lapply(names(results), function(inst) {
+  results[[inst]]$model_df_fit %>%
+    mutate(institution = inst) %>%
+    select(author_id, institution, degree, betweenness, window,
+           gender_primary, m_quotient, academic_age, paper_count, primary_subfield)
+})) %>%
+  mutate(institution = factor(institution, levels = c("UC3M", "UCM", "URJC", "UAM")))
+
+top_subfields_pooled <- pooled_df %>%
+  filter(primary_subfield != "no_papers_this_window") %>%
+  count(primary_subfield, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  pull(primary_subfield)
+
+pooled_df <- pooled_df %>%
+  mutate(primary_subfield_grp = factor(case_when(
+    primary_subfield == "no_papers_this_window" ~ "no_papers_this_window",
+    primary_subfield == "no_valid_subfield"      ~ "other_subfield",
+    primary_subfield %in% top_subfields_pooled    ~ primary_subfield,
+    TRUE                                           ~ "other_subfield"
+  ))) %>%
+  mutate(primary_subfield_grp = droplevels(primary_subfield_grp))
+
+cat("Pooled rows by institution x window:\n")
+print(count(pooled_df, institution, window))
+
+check_overdispersion(pooled_df$degree, "pooled degree")
+```
+
+```{r pooled-models-fit}
+m_pooled_glmnb <- MASS::glm.nb(
+  degree ~ gender_primary * window * institution + m_quotient + academic_age +
+    log1p(paper_count) + primary_subfield_grp,
+  data = pooled_df
+)
+check_nb_theta(m_pooled_glmnb, "pooled degree glm.nb")
+
+m_pooled_betw_lm <- stats::lm(
+  log1p(betweenness) ~ gender_primary * window * institution + m_quotient + academic_age +
+    log1p(paper_count) + primary_subfield_grp,
+  data = pooled_df
+)
+attr(m_pooled_betw_lm, "robust_vcov") <- sandwich::vcovCL(m_pooled_betw_lm, cluster = pooled_df$author_id)
+
+m_pooled_reduced <- MASS::glm.nb(
+  degree ~ (gender_primary + window + institution)^2 + m_quotient + academic_age +
+    log1p(paper_count) + primary_subfield_grp,
+  data = pooled_df
+)
+
+cat("Omnibus LRT -- does adding institution's three-way interaction improve fit:\n")
+print(anova(m_pooled_reduced, m_pooled_glmnb, test = "Chisq"))
+```
+
+```{r pooled-comparison-table}
+extract_pooled_terms <- function(coef_matrix, label) {
+  three_way <- grep("^gender_primaryfemale:windowpost_law:institution", rownames(coef_matrix), value = TRUE)
+  data.frame(
+    spec     = label,
+    contrast = paste(sub("^gender_primaryfemale:windowpost_law:institution", "", three_way), "vs UC3M"),
+    estimate = coef_matrix[three_way, 1],
+    p_value  = coef_matrix[three_way, 4],
+    row.names = NULL
+  )
+}
+
+pooled_comparison <- bind_rows(
+  extract_pooled_terms(summary(m_pooled_glmnb)$coefficients, "degree glm.nb"),
+  extract_pooled_terms(
+    lmtest::coeftest(m_pooled_betw_lm, vcov. = attr(m_pooled_betw_lm, "robust_vcov")),
+    "betweenness lm (log1p, clustered SE)"
+  )
+)
+print(pooled_comparison)
+```
+
+## Section H — Secondary RQ (i): gender homophily
+
+```{r homophily-test-functions}
+compute_assortativity_inputs <- function(net, gender_lookup, subfield_lookup) {
+  vids <- V(net$g)$name
+  gender_vec   <- gender_lookup[vids]
+  subfield_vec <- subfield_lookup[vids]
+
+  keep <- !is.na(gender_vec) & !is.na(subfield_vec)
+  g_sub <- induced_subgraph(net$g, vids = which(keep))
+  gender_codes <- as.integer(factor(gender_vec[keep], levels = c("male", "female")))
+
+  list(g_sub = g_sub, gender_codes = gender_codes, subfield_strata = subfield_vec[keep])
+}
+
+permutation_test_homophily <- function(inputs, n_perm = 2000, seed = 1) {
+  set.seed(seed)
+  g_sub <- inputs$g_sub; gender_codes <- inputs$gender_codes; strata <- inputs$subfield_strata
+  observed <- assortativity_nominal(g_sub, types = gender_codes, directed = FALSE)
+
+  null_dist <- replicate(n_perm, {
+    permuted <- gender_codes
+    for (s in unique(strata)) {
+      idx <- which(strata == s)
+      if (length(idx) > 1) permuted[idx] <- sample(gender_codes[idx])
+    }
+    assortativity_nominal(g_sub, types = permuted, directed = FALSE)
+  })
+
+  data.frame(
+    n_nodes   = vcount(g_sub),
+    observed  = observed,
+    null_mean = mean(null_dist),
+    null_sd   = sd(null_dist),
+    p_value   = mean(abs(null_dist) >= abs(observed))
+  )
+}
+```
+
+```{r run-homophily-all}
+homophily_results <- list()
+for (inst in names(networks)) {
+  gender_lookup_inst <- build_authors_with_gender(author_profiles[[inst]])
+  gender_lookup_vec  <- setNames(gender_lookup_inst$gender_primary, gender_lookup_inst$author_id)
+  gender_lookup_vec[gender_lookup_vec == "unclassifiable"] <- NA
+
+  subfield_baseline_df <- build_primary_subfield_from_edges(networks[[inst]]$baseline, core_ids[[inst]])
+  subfield_post_law_df <- build_primary_subfield_from_edges(networks[[inst]]$post_law, core_ids[[inst]])
+  subfield_lookup_baseline <- setNames(subfield_baseline_df$primary_subfield, subfield_baseline_df$author_id)
+  subfield_lookup_post_law <- setNames(subfield_post_law_df$primary_subfield, subfield_post_law_df$author_id)
+
+  homophily_results[[inst]] <- bind_rows(
+    baseline = permutation_test_homophily(
+      compute_assortativity_inputs(networks[[inst]]$baseline, gender_lookup_vec, subfield_lookup_baseline)
+    ),
+    post_law = permutation_test_homophily(
+      compute_assortativity_inputs(networks[[inst]]$post_law, gender_lookup_vec, subfield_lookup_post_law)
+    ),
+    .id = "window"
+  )
+}
+
+homophily_comparison <- bind_rows(homophily_results, .id = "institution")
+print(homophily_comparison)
+```
+
+## Section I — Community detection
+
+```{r community-detection-full}
+run_community_detection <- function(inst) {
+  core_ids_inst <- core_ids[[inst]]
+  author_profiles_inst <- author_profiles[[inst]]
+
+  gender_lookup_inst <- build_authors_with_gender(author_profiles_inst)
+  gender_lookup_vec  <- setNames(gender_lookup_inst$gender_primary, gender_lookup_inst$author_id)
+  gender_lookup_vec[gender_lookup_vec == "unclassifiable"] <- NA
+
+  run_one_window <- function(net, window_label) {
+    g_full <- net$g
+    comp <- igraph::components(g_full)
+    giant_vids <- which(comp$membership == which.max(comp$csize))
+    g <- igraph::induced_subgraph(g_full, vids = giant_vids)
+
+    comm <- igraph::cluster_louvain(g, weights = E(g)$weight)
+
+    subfield_df <- build_primary_subfield_from_edges(net, core_ids_inst)
+    subfield_lookup <- setNames(subfield_df$primary_subfield, subfield_df$author_id)
+
+    vids <- V(g)$name
+    subfield_vec   <- unname(subfield_lookup[vids])
+    gender_vec     <- unname(gender_lookup_vec[vids])
+    membership_vec <- igraph::membership(comm)
+
+    valid_subfield <- !is.na(subfield_vec)
+    nmi <- if (sum(valid_subfield) > 1) {
+      igraph::compare(
+        as.integer(membership_vec[valid_subfield]),
+        as.integer(factor(subfield_vec[valid_subfield])),
+        method = "nmi"
+      )
+    } else NA_real_
+
+    comm_gender <- data.frame(
+      author_id = vids,
+      community = as.integer(membership_vec),
+      gender    = gender_vec,
+      stringsAsFactors = FALSE
+    ) %>%
+      filter(gender %in% c("male", "female")) %>%
+      group_by(community) %>%
+      mutate(n_in_community = n()) %>%
+      ungroup() %>%
+      filter(n_in_community >= 10)
+
+    chisq_test_result <- if (nrow(comm_gender) > 0 && length(unique(comm_gender$community)) > 1) {
+      tryCatch(chisq.test(table(comm_gender$community, comm_gender$gender)), error = function(e) NULL)
+    } else NULL
+    chisq_p <- if (!is.null(chisq_test_result)) chisq_test_result$p.value else NA_real_
+    cramers_v <- if (!is.null(chisq_test_result)) {
+      tbl <- table(comm_gender$community, comm_gender$gender)
+      k <- min(nrow(tbl), ncol(tbl))
+      sqrt(as.numeric(chisq_test_result$statistic) / (sum(tbl) * (k - 1)))
+    } else NA_real_
+
+    gender_by_community <- comm_gender %>%
+      group_by(community) %>%
+      summarise(n = n(), pct_female = mean(gender == "female"), .groups = "drop") %>%
+      arrange(desc(n))
+
+    subfield_by_community <- data.frame(
+      community = as.integer(membership_vec),
+      subfield  = subfield_vec,
+      stringsAsFactors = FALSE
+    ) %>%
+      filter(!is.na(subfield)) %>%
+      count(community, subfield, name = "n_subfield") %>%
+      group_by(community) %>%
+      mutate(community_n_subfield_classified = sum(n_subfield)) %>%
+      slice_max(n_subfield, n = 1, with_ties = FALSE) %>%
+      ungroup() %>%
+      transmute(
+        community,
+        dominant_subfield = subfield,
+        subfield_purity   = round(n_subfield / community_n_subfield_classified, 3)
+      )
+
+    community_profile <- data.frame(community = as.integer(membership_vec)) %>%
+      count(community, name = "n_total") %>%
+      full_join(gender_by_community %>% select(community, n_gender_classified = n, pct_female), by = "community") %>%
+      full_join(subfield_by_community, by = "community") %>%
+      arrange(desc(n_total))
+
+    list(
+      window              = window_label,
+      n_nodes_total        = vcount(g_full),
+      n_nodes_giant        = vcount(g),
+      giant_comp_share     = round(vcount(g) / vcount(g_full), 3),
+      n_communities        = length(comm),
+      modularity           = igraph::modularity(comm),
+      nmi_vs_subfield      = nmi,
+      chisq_p_gender       = chisq_p,
+      cramers_v_gender     = cramers_v,
+      community_profile    = community_profile
+    )
+  }
+
+  list(
+    baseline = run_one_window(networks[[inst]]$baseline, "baseline"),
+    post_law = run_one_window(networks[[inst]]$post_law, "post_law")
+  )
+}
+
+community_results <- list()
+for (inst in names(networks)) {
+  community_results[[inst]] <- run_community_detection(inst)
+}
+
+community_comparison <- bind_rows(lapply(names(community_results), function(inst) {
+  bind_rows(lapply(community_results[[inst]], function(r) {
+    data.frame(
+      institution      = inst,
+      window           = r$window,
+      n_nodes_total    = r$n_nodes_total,
+      n_nodes_giant    = r$n_nodes_giant,
+      giant_comp_share = r$giant_comp_share,
+      n_communities    = r$n_communities,
+      modularity       = round(r$modularity, 3),
+      nmi_vs_subfield  = round(r$nmi_vs_subfield, 3),
+      chisq_p_gender   = signif(r$chisq_p_gender, 3),
+      cramers_v_gender = round(r$cramers_v_gender, 3)
+    )
+  }))
+}))
+print(community_comparison)
+```
+
+## Section J — Secondary RQ (ii): refined temporal windows
+
+```{r temporal-pipeline-function}
+windows_refined <- list(
+  ciencia_only = c(from = "2022-01-01", to = "2024-07-31"),
+  paridad_era  = c(from = "2024-08-01", to = "2025-12-31")
+)
+
+build_temporal_networks <- function(inst) {
+  edges_inst    <- edges_by_institution[[inst]]
+  core_ids_inst <- core_ids[[inst]]
+
+  edges_ciencia_only <- edges_inst %>%
+    filter(publication_date >= windows_refined$ciencia_only["from"],
+           publication_date <= windows_refined$ciencia_only["to"])
+  edges_paridad_era <- edges_inst %>%
+    filter(publication_date >= windows_refined$paridad_era["from"],
+           publication_date <= windows_refined$paridad_era["to"])
+
+  list(
+    ciencia_only = build_network_from_edges(edges_ciencia_only, max_authors = 20, restrict_to_ids = core_ids_inst),
+    paridad_era  = build_network_from_edges(edges_paridad_era,  max_authors = 20, restrict_to_ids = core_ids_inst)
+  )
+}
+
+run_temporal_pipeline <- function(inst) {
+  cat(sprintf("\n=== %s (temporal) ===\n", inst))
+  temporal_nets <- build_temporal_networks(inst)
+  net_baseline_inst <- networks[[inst]]$baseline
+
+  print(bind_rows(
+    network_diagnostics(net_baseline_inst$g, paste(inst, "baseline")),
+    network_diagnostics(temporal_nets$ciencia_only$g, paste(inst, "ciencia_only")),
+    network_diagnostics(temporal_nets$paridad_era$g,  paste(inst, "paridad_era"))
+  ))
+
+  model_df_fit_temporal <- build_model_df_for_windows(
+    inst,
+    nets_by_window = list(baseline = net_baseline_inst,
+                          ciencia_only = temporal_nets$ciencia_only,
+                          paridad_era = temporal_nets$paridad_era),
+    current_years_by_window = list(baseline = 2019, ciencia_only = 2024, paridad_era = 2025)
+  )
+
+  cat(sprintf("%s: model_df_fit_temporal rows by window:\n", inst))
+  print(count(model_df_fit_temporal, window))
+
+  m_temporal <- MASS::glm.nb(
+    degree ~ gender_primary * window + m_quotient + academic_age +
+      log1p(paper_count) + primary_subfield_grp,
+    data = model_df_fit_temporal
+  )
+  check_nb_theta(m_temporal, paste(inst, "temporal glm.nb"))
+
+  s <- summary(m_temporal)$coefficients
+  comparison <- data.frame(
+    institution = inst,
+    contrast = c("ciencia_only vs baseline", "paridad_era vs baseline"),
+    estimate = c(s["gender_primaryfemale:windowciencia_only", "Estimate"],
+                 s["gender_primaryfemale:windowparidad_era", "Estimate"]),
+    p_value  = c(s["gender_primaryfemale:windowciencia_only", "Pr(>|z|)"],
+                 s["gender_primaryfemale:windowparidad_era", "Pr(>|z|)"])
+  )
+
+  list(model_df_fit_temporal = model_df_fit_temporal, model = m_temporal, comparison = comparison)
+}
+```
+
+```{r run-temporal-pipeline-all}
+temporal_results <- list()
+for (inst in names(networks)) {
+  temporal_results[[inst]] <- run_temporal_pipeline(inst)
+}
+
+temporal_comparison <- bind_rows(lapply(temporal_results, function(r) r$comparison))
+print(temporal_comparison)
+```
+
+```{r temporal-homophily-function}
+run_temporal_homophily <- function(inst) {
+  core_ids_inst <- core_ids[[inst]]
+  author_profiles_inst <- author_profiles[[inst]]
+
+  temporal_nets     <- build_temporal_networks(inst)
+  net_baseline_inst <- networks[[inst]]$baseline
+
+  gender_lookup_inst <- build_authors_with_gender(author_profiles_inst)
+  gender_lookup_vec  <- setNames(gender_lookup_inst$gender_primary, gender_lookup_inst$author_id)
+  gender_lookup_vec[gender_lookup_vec == "unclassifiable"] <- NA
+
+  subfield_lookup_for <- function(net) {
+    df <- build_primary_subfield_from_edges(net, core_ids_inst)
+    setNames(df$primary_subfield, df$author_id)
+  }
+
+  bind_rows(
+    baseline = permutation_test_homophily(
+      compute_assortativity_inputs(net_baseline_inst, gender_lookup_vec, subfield_lookup_for(net_baseline_inst))
+    ),
+    ciencia_only = permutation_test_homophily(
+      compute_assortativity_inputs(temporal_nets$ciencia_only, gender_lookup_vec, subfield_lookup_for(temporal_nets$ciencia_only))
+    ),
+    paridad_era = permutation_test_homophily(
+      compute_assortativity_inputs(temporal_nets$paridad_era, gender_lookup_vec, subfield_lookup_for(temporal_nets$paridad_era))
+    ),
+    .id = "window"
+  )
+}
+
+temporal_homophily_results <- list()
+for (inst in names(networks)) {
+  temporal_homophily_results[[inst]] <- run_temporal_homophily(inst)
+}
+
+temporal_homophily_comparison <- bind_rows(temporal_homophily_results, .id = "institution")
+print(temporal_homophily_comparison)
+```
+
+## Section K — Full statistical results export
+
+```{r tidy-model-function}
+tidy_model <- function(model, label) {
+  one_table <- function(coef_mat, component = NA_character_) {
+    data.frame(
+      term      = rownames(coef_mat),
+      component = component,
+      estimate  = coef_mat[, 1],
+      std.error = coef_mat[, 2],
+      statistic = coef_mat[, 3],
+      p.value   = coef_mat[, 4],
+      row.names = NULL,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  robust_vcov <- attr(model, "robust_vcov")
+
+  out <- if (!is.null(robust_vcov)) {
+    one_table(lmtest::coeftest(model, vcov. = robust_vcov), NA_character_)
+  } else if (inherits(model, "zeroinfl") || inherits(model, "hurdle")) {
+    s <- summary(model)$coefficients
+    rbind(one_table(s$count, "count"), one_table(s$zero, "zero"))
+  } else if (inherits(model, "merMod")) {
+    cm <- summary(model)$coefficients
+    if (ncol(cm) < 4) {
+      cm <- cbind(cm, 2 * stats::pnorm(-abs(cm[, 3])))
+    }
+    one_table(cm, "fixed")
+  } else {
+    one_table(summary(model)$coefficients, NA_character_)
+  }
+
+  out$conf.low  <- out$estimate - 1.96 * out$std.error
+  out$conf.high <- out$estimate + 1.96 * out$std.error
+  out$model <- label
+  out[, c("model", "component", "term", "estimate", "std.error", "statistic",
+          "p.value", "conf.low", "conf.high")]
+}
+```
+
+```{r export-all-model-coefficients}
+all_model_results <- bind_rows(
+  bind_rows(lapply(names(results), function(inst) {
+    bind_rows(lapply(names(results[[inst]]$models), function(spec) {
+      tidy_model(results[[inst]]$models[[spec]], label = paste(inst, spec)) %>%
+        mutate(institution = inst, spec = spec, analysis = "baseline_vs_post_law")
+    }))
+  })),
+  bind_rows(lapply(names(temporal_results), function(inst) {
+    tidy_model(temporal_results[[inst]]$model, label = paste(inst, "temporal glm.nb")) %>%
+      mutate(institution = inst, spec = "glm.nb", analysis = "temporal_3window")
+  })),
+  tidy_model(m_pooled_glmnb, "pooled degree glm.nb") %>%
+    mutate(institution = "pooled", spec = "glm.nb", analysis = "pooled_degree"),
+  tidy_model(m_pooled_betw_lm, "pooled betweenness lm (log1p, clustered SE)") %>%
+    mutate(institution = "pooled", spec = "lm_clustered", analysis = "pooled_betweenness"),
+  tidy_model(m_pooled_reduced, "pooled degree glm.nb (reduced, no 3-way term)") %>%
+    mutate(institution = "pooled", spec = "glm.nb", analysis = "pooled_degree_reduced")
+)
+
+cat(sprintf("Full coefficient table: %d rows across %d model fits\n",
+            nrow(all_model_results), length(unique(all_model_results$model))))
+write.csv(all_model_results, file.path(data_dir, "all_model_coefficients.csv"), row.names = FALSE)
+print(head(all_model_results, 10))
+```
+
+```{r export-model-fit-stats}
+model_fit_stats <- function(model, label) {
+  n_obs <- if (inherits(model, "merMod")) stats::nobs(model) else length(stats::residuals(model))
+  aic_val <- tryCatch(stats::AIC(model), error = function(e) NA_real_)
+  theta_val <- if (inherits(model, "merMod")) {
+    NA_real_
+  } else {
+    tryCatch(if (!is.null(model$theta)) model$theta else NA_real_, error = function(e) NA_real_)
+  }
+  data.frame(model = label, n_obs = n_obs, aic = aic_val, theta = theta_val,
+             stringsAsFactors = FALSE)
+}
+
+all_model_fit_stats <- bind_rows(
+  bind_rows(lapply(names(results), function(inst) {
+    bind_rows(lapply(names(results[[inst]]$models), function(spec) {
+      model_fit_stats(results[[inst]]$models[[spec]], paste(inst, spec))
+    }))
+  })),
+  bind_rows(lapply(names(temporal_results), function(inst) {
+    model_fit_stats(temporal_results[[inst]]$model, paste(inst, "temporal glm.nb"))
+  })),
+  model_fit_stats(m_pooled_glmnb, "pooled degree glm.nb"),
+  model_fit_stats(m_pooled_betw_lm, "pooled betweenness lm (log1p, clustered SE)"),
+  model_fit_stats(m_pooled_reduced, "pooled degree glm.nb (reduced, no 3-way term)")
+)
+write.csv(all_model_fit_stats, file.path(data_dir, "all_model_fit_stats.csv"), row.names = FALSE)
+print(all_model_fit_stats)
+```
+
+```{r export-homophily-community-results}
+write.csv(homophily_comparison, file.path(data_dir, "homophily_results_2window.csv"), row.names = FALSE)
+write.csv(temporal_homophily_comparison, file.path(data_dir, "homophily_results_3window.csv"), row.names = FALSE)
+write.csv(community_comparison, file.path(data_dir, "community_detection_summary.csv"), row.names = FALSE)
+
+community_profiles_all <- bind_rows(lapply(names(community_results), function(inst) {
+  bind_rows(lapply(names(community_results[[inst]]), function(window) {
+    community_results[[inst]][[window]]$community_profile %>%
+      mutate(institution = inst, window = window)
+  }))
+}))
+write.csv(community_profiles_all, file.path(data_dir, "community_profiles_all.csv"), row.names = FALSE)
+
+cat("Exported to", data_dir, ":\n")
+cat(" - all_model_coefficients.csv   (", nrow(all_model_results), "rows)\n")
+cat(" - all_model_fit_stats.csv      (", nrow(all_model_fit_stats), "rows)\n")
+cat(" - homophily_results_2window.csv(", nrow(homophily_comparison), "rows)\n")
+cat(" - homophily_results_3window.csv(", nrow(temporal_homophily_comparison), "rows)\n")
+cat(" - community_detection_summary.csv(", nrow(community_comparison), "rows)\n")
+cat(" - community_profiles_all.csv   (", nrow(community_profiles_all), "rows)\n")
+```
+
+## Section L — Figures for the thesis
+
+```{r figures-setup}
+figures_dir <- "figures"
+dir.create(figures_dir, showWarnings = FALSE)
+```
+
+```{r figure-1-community-cramers-v}
+fig1_data <- community_comparison %>%
+  mutate(
+    window = factor(window, levels = c("baseline", "post_law"), labels = c("Baseline", "Post-law")),
+    institution = factor(institution, levels = rev(c("UC3M", "UCM", "URJC", "UAM")))
+  )
+
+fig1 <- ggplot2::ggplot(fig1_data, ggplot2::aes(x = institution, y = cramers_v_gender, fill = window)) +
+  ggplot2::geom_col(position = ggplot2::position_dodge(width = 0.7), width = 0.6) +
+  ggplot2::coord_flip() +
+  ggplot2::scale_fill_grey(start = 0.3, end = 0.75) +
+  ggplot2::labs(x = NULL, y = "Cramér's V (community structure x gender)",
+                fill = "Window") +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(legend.position = "bottom")
+
+ggplot2::ggsave(file.path(figures_dir, "fig1_community_cramers_v.png"), fig1,
+                 width = 7, height = 4, dpi = 300)
+fig1
+```
+
+```{r figure-2-temporal-panels}
+degree_traj <- bind_rows(
+  data.frame(institution = names(results), window = "baseline",
+             estimate = 0, conf.low = 0, conf.high = 0),
+  all_model_results %>%
+    filter(analysis == "temporal_3window") %>%
+    mutate(window = if_else(grepl("ciencia_only", term), "ciencia_only", "paridad_era")) %>%
+    select(institution, window, estimate, conf.low, conf.high)
+) %>%
+  mutate(window = factor(window, levels = c("baseline", "ciencia_only", "paridad_era")))
+
+homophily_traj <- temporal_homophily_comparison %>%
+  mutate(excess = observed - null_mean,
+         window = factor(window, levels = c("baseline", "ciencia_only", "paridad_era"))) %>%
+  select(institution, window, excess)
+
+fig2a <- ggplot2::ggplot(degree_traj, ggplot2::aes(x = window, y = estimate, color = institution,
+                                                    linetype = institution, shape = institution,
+                                                    group = institution)) +
+  ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  ggplot2::geom_line() +
+  ggplot2::geom_pointrange(ggplot2::aes(ymin = conf.low, ymax = conf.high),
+                            position = ggplot2::position_dodge(width = 0.1)) +
+  ggplot2::scale_color_grey(start = 0.1, end = 0.7) +
+  ggplot2::labs(x = NULL, y = "Degree effect (vs. baseline, 95% CI)",
+                color = "Institution", linetype = "Institution", shape = "Institution") +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(legend.position = "bottom")
+
+fig2b <- ggplot2::ggplot(homophily_traj, ggplot2::aes(x = window, y = excess, color = institution,
+                                                       linetype = institution, shape = institution,
+                                                       group = institution)) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point(size = 2) +
+  ggplot2::scale_color_grey(start = 0.1, end = 0.7) +
+  ggplot2::labs(x = NULL, y = "Homophily excess over null",
+                color = "Institution", linetype = "Institution", shape = "Institution") +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(legend.position = "bottom")
+
+ggplot2::ggsave(file.path(figures_dir, "fig2a_degree_temporal_trajectory.png"), fig2a,
+                 width = 6, height = 4, dpi = 300)
+ggplot2::ggsave(file.path(figures_dir, "fig2b_homophily_temporal_trajectory.png"), fig2b,
+                 width = 6, height = 4, dpi = 300)
+fig2a
+fig2b
+```
+
+```{r figure-3-cross-metric-comparison}
+cross_metric_data <- all_model_results %>%
+  filter(analysis == "baseline_vs_post_law",
+         term == "gender_primaryfemale:windowpost_law",
+         spec %in% c("mixed", "betw_lmer")) %>%
+  mutate(
+    metric = recode(spec, mixed = "Degree", betw_lmer = "Betweenness"),
+    institution = factor(institution, levels = rev(c("UC3M", "UCM", "URJC", "UAM")))
+  )
+
+fig3 <- ggplot2::ggplot(cross_metric_data, ggplot2::aes(x = institution, y = statistic, fill = metric)) +
+  ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  ggplot2::geom_col(position = ggplot2::position_dodge(width = 0.7), width = 0.6) +
+  ggplot2::coord_flip() +
+  ggplot2::scale_fill_grey(start = 0.3, end = 0.75) +
+  ggplot2::labs(x = NULL, y = "Standardized effect size (Wald z / t, gender x post-law window)",
+                fill = "Centrality metric") +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(legend.position = "bottom")
+
+ggplot2::ggsave(file.path(figures_dir, "fig3_cross_metric_comparison.png"), fig3,
+                 width = 7, height = 4, dpi = 300)
+fig3
+```
+
