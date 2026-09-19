@@ -7,6 +7,7 @@ This holds the code for my Master's Thesis in Computational Social Science at UC
 ```
 TFM-UC3M-SAM/
 ├── README.md
+├── Tim_pipeline.html             # HTML render after running the quarto document
 ├── Thesis.Rproj                  # open this in RStudio to get the correct working directory
 ├── session_info.txt              # exact R + package versions used
 ├── tfm_pipeline.qmd               # the full pipeline: fetch, networks, models, homophily, community detection, export
